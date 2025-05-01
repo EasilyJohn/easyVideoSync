@@ -606,7 +606,7 @@ class VR180SyncApp(QMainWindow):
             results += f"Start the right video from frame 0 and the left video from frame {abs(frame_offset)}.\n"
         elif frame_offset < 0:
             results += f"The left video is {abs(frame_offset)} frames ahead of the right video.\n"
-            results += f"Start the left video from frame 0 and the right video from frame {abs(frame_offset)}.\n"
+            results += f"Start the left video from frame {abs(frame_offset)} and the right video from frame 0.\n"
         else:
             results += "Both videos are perfectly synchronized! No offset needed.\n"
         
