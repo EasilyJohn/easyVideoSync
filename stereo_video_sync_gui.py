@@ -52,8 +52,14 @@ class AudioProcessingThread(QThread):
             duration = frame_count / fps
             cap.release()
             
+            # Handle full video case
+            if self.start_time is None:
+                self.start_time = 0
+            if self.end_time is None:
+                self.end_time = duration
+            
             # Validate time window
-            if self.end_time is None or self.end_time > duration:
+            if self.end_time > duration:
                 self.end_time = duration
             if self.start_time >= self.end_time:
                 self.error_occurred.emit("Start time must be less than end time")
