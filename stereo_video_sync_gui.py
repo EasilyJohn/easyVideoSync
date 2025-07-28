@@ -13,7 +13,7 @@ from matplotlib.figure import Figure
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                             QSlider, QLineEdit, QTextEdit, QGroupBox, 
-                            QMessageBox, QProgressBar, QCheckBox)
+                            QMessageBox, QProgressBar, QCheckBox, QSpinBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon
 
@@ -30,11 +30,13 @@ class AudioProcessingThread(QThread):
     processing_complete = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
     
-    def __init__(self, video_path, threshold, max_peaks):
+    def __init__(self, video_path, threshold, max_peaks, start_time=0, end_time=None):
         super().__init__()
         self.video_path = video_path
         self.threshold = threshold
         self.max_peaks = max_peaks
+        self.start_time = start_time  # Start time in seconds
+        self.end_time = end_time      # End time in seconds (None = end of video)
     
     def run(self):
         try:
@@ -43,9 +45,23 @@ class AudioProcessingThread(QThread):
             unique_id = uuid.uuid4().hex[:8]
             temp_wav = f"temp_audio_{unique_id}_{os.path.basename(self.video_path)}.wav"
             
-            # Extract audio
+            # Get video info first
+            cap = cv2.VideoCapture(self.video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = frame_count / fps
+            cap.release()
+            
+            # Validate time window
+            if self.end_time is None or self.end_time > duration:
+                self.end_time = duration
+            if self.start_time >= self.end_time:
+                self.error_occurred.emit("Start time must be less than end time")
+                return
+            
+            # Extract audio with time window
             self.progress_update.emit(20)
-            if not self.extract_audio(self.video_path, temp_wav):
+            if not self.extract_audio_segment(self.video_path, temp_wav, self.start_time, self.end_time):
                 self.error_occurred.emit(f"Failed to extract audio from {self.video_path}")
                 return
             
@@ -89,7 +105,7 @@ class AudioProcessingThread(QThread):
             peaks_indices = sorted(potential_peaks[sorted_indices])
             
             if not peaks_indices:
-                self.error_occurred.emit(f"No peaks found above threshold {self.threshold}. Try lowering the threshold.")
+                self.error_occurred.emit(f"No peaks found above threshold {self.threshold} in the specified time window. Try lowering the threshold.")
                 try:
                     os.remove(temp_wav)
                 except:
@@ -97,28 +113,28 @@ class AudioProcessingThread(QThread):
                 return
             
             self.progress_update.emit(80)
-            # Get video info
-            cap = cv2.VideoCapture(self.video_path)
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            duration = frame_count / fps
-            cap.release()
             
-            # Convert peaks to times and frames
-            peak_times = [idx / sample_rate for idx in peaks_indices]
+            # Convert peaks to times and frames (relative to start of video, not segment)
+            segment_duration = self.end_time - self.start_time
+            peak_times_in_segment = [idx / sample_rate for idx in peaks_indices]
+            peak_times_absolute = [t + self.start_time for t in peak_times_in_segment]  # Absolute time in video
             peak_values = [abs_audio[idx] for idx in peaks_indices]
-            peak_frames = [int(time * fps) for time in peak_times]
+            peak_frames_absolute = [int(time * fps) for time in peak_times_absolute]  # Absolute frame numbers
             
             # Prepare plot data
             plot_data = {
                 'abs_audio': abs_audio,
                 'sample_rate': sample_rate,
-                'peak_times': peak_times,
+                'peak_times': peak_times_in_segment,  # For plotting (relative to segment)
+                'peak_times_absolute': peak_times_absolute,  # For calculations (absolute)
                 'peak_values': peak_values,
-                'peak_frames': peak_frames,
+                'peak_frames': peak_frames_absolute,  # Absolute frame numbers for sync
                 'fps': fps,
                 'threshold': threshold,
-                'duration': duration
+                'duration': duration,
+                'segment_duration': segment_duration,
+                'start_time': self.start_time,
+                'end_time': self.end_time
             }
             
             self.progress_update.emit(90)
@@ -134,11 +150,14 @@ class AudioProcessingThread(QThread):
         except Exception as e:
             self.error_occurred.emit(f"An error occurred: {str(e)}")
     
-    def extract_audio(self, video_path, output_audio_path):
-        """Extract audio from video file using ffmpeg"""
+    def extract_audio_segment(self, video_path, output_audio_path, start_time, end_time):
+        """Extract audio segment from video file using ffmpeg"""
+        duration = end_time - start_time
         command = [
             'ffmpeg',
             '-i', video_path,
+            '-ss', str(start_time),     # Start time
+            '-t', str(duration),        # Duration
             '-q:a', '0',
             '-map', 'a',
             '-y',  # Overwrite output file if it exists
@@ -276,7 +295,7 @@ class VR180SyncApp(QMainWindow):
         super().__init__()
         
         self.setWindowTitle("VR180 Sync Tool")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1200, 900)
         
         self.left_video_path = ""
         self.right_video_path = ""
@@ -321,6 +340,53 @@ class VR180SyncApp(QMainWindow):
         file_layout.addLayout(left_layout)
         file_layout.addLayout(right_layout)
         file_group.setLayout(file_layout)
+        
+        # Time window selection area
+        time_window_group = QGroupBox("Analysis Time Window")
+        time_window_layout = QVBoxLayout()
+        
+        # Instructions
+        instruction_label = QLabel("Set the time window to analyze (useful for clap cues at start/end of video):")
+        instruction_label.setStyleSheet("font-style: italic; color: #666;")
+        time_window_layout.addWidget(instruction_label)
+        
+        # Time inputs
+        time_inputs_layout = QHBoxLayout()
+        
+        # Start time
+        start_time_layout = QVBoxLayout()
+        start_time_label = QLabel("Start Time (seconds):")
+        self.start_time_spinbox = QSpinBox()
+        self.start_time_spinbox.setMinimum(0)
+        self.start_time_spinbox.setMaximum(3600)  # Max 1 hour
+        self.start_time_spinbox.setValue(0)
+        self.start_time_spinbox.setSuffix(" sec")
+        
+        start_time_layout.addWidget(start_time_label)
+        start_time_layout.addWidget(self.start_time_spinbox)
+        
+        # End time
+        end_time_layout = QVBoxLayout()
+        end_time_label = QLabel("End Time (seconds):")
+        self.end_time_spinbox = QSpinBox()
+        self.end_time_spinbox.setMinimum(1)
+        self.end_time_spinbox.setMaximum(3600)  # Max 1 hour
+        self.end_time_spinbox.setValue(30)  # Default to first 30 seconds
+        self.end_time_spinbox.setSuffix(" sec")
+        
+        end_time_layout.addWidget(end_time_label)
+        end_time_layout.addWidget(self.end_time_spinbox)
+        
+        # Use full video checkbox
+        self.use_full_video_checkbox = QCheckBox("Use full video duration")
+        self.use_full_video_checkbox.toggled.connect(self.toggle_time_window)
+        
+        time_inputs_layout.addLayout(start_time_layout)
+        time_inputs_layout.addLayout(end_time_layout)
+        time_inputs_layout.addWidget(self.use_full_video_checkbox)
+        
+        time_window_layout.addLayout(time_inputs_layout)
+        time_window_group.setLayout(time_window_layout)
         
         # Settings area
         settings_group = QGroupBox("Analysis Settings")
@@ -407,6 +473,7 @@ class VR180SyncApp(QMainWindow):
         
         # Add everything to main layout
         main_layout.addWidget(file_group)
+        main_layout.addWidget(time_window_group)
         main_layout.addWidget(settings_group)
         main_layout.addLayout(process_layout)
         main_layout.addWidget(self.progress_bar)
@@ -415,6 +482,11 @@ class VR180SyncApp(QMainWindow):
         
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
+    
+    def toggle_time_window(self, checked):
+        """Enable/disable time window controls"""
+        self.start_time_spinbox.setEnabled(not checked)
+        self.end_time_spinbox.setEnabled(not checked)
     
     def update_threshold_label(self):
         """Update the threshold value label when slider changes"""
@@ -435,6 +507,9 @@ class VR180SyncApp(QMainWindow):
                 self.left_video_path = file_path
                 self.left_path_edit.setText(file_path)
                 self.process_left_btn.setEnabled(True)
+                
+                # Update time window based on video duration
+                self.update_time_window_limits(file_path)
             else:
                 self.right_video_path = file_path
                 self.right_path_edit.setText(file_path)
@@ -443,6 +518,31 @@ class VR180SyncApp(QMainWindow):
             # Enable auto sync button if both videos are selected and processed
             if self.left_data and self.right_data:
                 self.auto_sync_btn.setEnabled(True)
+    
+    def update_time_window_limits(self, video_path):
+        """Update time window spinbox limits based on video duration"""
+        try:
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = int(frame_count / fps)
+            cap.release()
+            
+            self.end_time_spinbox.setMaximum(duration)
+            if self.end_time_spinbox.value() > duration:
+                self.end_time_spinbox.setValue(min(30, duration))
+            
+        except Exception as e:
+            print(f"Error getting video duration: {e}")
+    
+    def get_time_window(self):
+        """Get the current time window settings"""
+        if self.use_full_video_checkbox.isChecked():
+            return None, None  # Use full video
+        else:
+            start_time = self.start_time_spinbox.value()
+            end_time = self.end_time_spinbox.value()
+            return start_time, end_time
     
     def process_left_video(self):
         """Process the left video to find audio peaks"""
@@ -456,8 +556,10 @@ class VR180SyncApp(QMainWindow):
         except:
             max_peaks = 15
         
+        start_time, end_time = self.get_time_window()
+        
         # Start processing thread
-        self.left_thread = AudioProcessingThread(self.left_video_path, threshold, max_peaks)
+        self.left_thread = AudioProcessingThread(self.left_video_path, threshold, max_peaks, start_time, end_time)
         self.left_thread.progress_update.connect(self.update_progress)
         self.left_thread.processing_complete.connect(self.left_processing_complete)
         self.left_thread.error_occurred.connect(self.show_error)
@@ -478,8 +580,10 @@ class VR180SyncApp(QMainWindow):
         except:
             max_peaks = 15
         
+        start_time, end_time = self.get_time_window()
+        
         # Start processing thread
-        self.right_thread = AudioProcessingThread(self.right_video_path, threshold, max_peaks)
+        self.right_thread = AudioProcessingThread(self.right_video_path, threshold, max_peaks, start_time, end_time)
         self.right_thread.progress_update.connect(self.update_progress)
         self.right_thread.processing_complete.connect(self.right_processing_complete)
         self.right_thread.error_occurred.connect(self.show_error)
@@ -528,15 +632,26 @@ class VR180SyncApp(QMainWindow):
         
         self.left_canvas.axes.set_xlabel('Time (seconds)')
         self.left_canvas.axes.set_ylabel('Audio Amplitude')
-        self.left_canvas.axes.set_title('Left Video Audio Peaks')
+        
+        # Update title to show time window
+        if data['start_time'] > 0 or data['end_time'] < data['duration']:
+            title = f"Left Video Audio Peaks ({data['start_time']:.1f}s - {data['end_time']:.1f}s)"
+        else:
+            title = "Left Video Audio Peaks"
+        self.left_canvas.axes.set_title(title)
+        
         self.left_canvas.axes.grid(True)
-        self.left_canvas.axes.set_xlim(0, data['duration'])
+        self.left_canvas.axes.set_xlim(0, data['segment_duration'])
         
         self.left_canvas.fig.tight_layout()
         self.left_canvas.draw()
         
         # Add peak info to results
-        peak_info = "Left Video Peak Frames:\n"
+        time_window_info = ""
+        if data['start_time'] > 0 or data['end_time'] < data['duration']:
+            time_window_info = f"Analysis Window: {data['start_time']:.1f}s - {data['end_time']:.1f}s\n"
+        
+        peak_info = f"{time_window_info}Left Video Peak Frames:\n"
         for i, frame in enumerate(data['peak_frames']):
             peak_info += f"Peak {i+1}: Frame {frame}\n"
         
@@ -562,16 +677,28 @@ class VR180SyncApp(QMainWindow):
         
         self.right_canvas.axes.set_xlabel('Time (seconds)')
         self.right_canvas.axes.set_ylabel('Audio Amplitude')
-        self.right_canvas.axes.set_title('Right Video Audio Peaks')
+        
+        # Update title to show time window
+        if data['start_time'] > 0 or data['end_time'] < data['duration']:
+            title = f"Right Video Audio Peaks ({data['start_time']:.1f}s - {data['end_time']:.1f}s)"
+        else:
+            title = "Right Video Audio Peaks"
+        self.right_canvas.axes.set_title(title)
+        
         self.right_canvas.axes.grid(True)
-        self.right_canvas.axes.set_xlim(0, data['duration'])
+        self.right_canvas.axes.set_xlim(0, data['segment_duration'])
         
         self.right_canvas.fig.tight_layout()
         self.right_canvas.draw()
         
         # Add peak info to results
         current_text = self.results_text.toPlainText()
-        peak_info = current_text + "\n\nRight Video Peak Frames:\n"
+        
+        time_window_info = ""
+        if data['start_time'] > 0 or data['end_time'] < data['duration']:
+            time_window_info = f"\nAnalysis Window: {data['start_time']:.1f}s - {data['end_time']:.1f}s\n"
+        
+        peak_info = current_text + f"{time_window_info}Right Video Peak Frames:\n"
         for i, frame in enumerate(data['peak_frames']):
             peak_info += f"Peak {i+1}: Frame {frame}\n"
         
