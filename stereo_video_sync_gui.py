@@ -377,7 +377,7 @@ class VR180SyncApp(QMainWindow):
         self.end_time_spinbox = QSpinBox()
         self.end_time_spinbox.setMinimum(1)
         self.end_time_spinbox.setMaximum(3600)  # Max 1 hour
-        self.end_time_spinbox.setValue(30)  # Default to first 30 seconds
+        self.end_time_spinbox.setValue(2)  # Default to first 2 seconds
         self.end_time_spinbox.setSuffix(" sec")
         
         end_time_layout.addWidget(end_time_label)
